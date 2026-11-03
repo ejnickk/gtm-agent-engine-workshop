@@ -15,6 +15,7 @@ Install:
 """
 
 import json
+import math
 import os
 import random
 import uuid
@@ -25,7 +26,7 @@ load_dotenv(override=True)
 # Enable LangSmith tracing; project / API key come from the environment or .env.
 os.environ.setdefault("LANGSMITH_TRACING", "true")
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from langchain.tools import tool, ToolRuntime
 from langchain_openai import ChatOpenAI
 from deepagents import create_deep_agent
@@ -68,13 +69,12 @@ def build_prospect_profile(prospect_id: str) -> dict:
 
 
 SCORING_PROMPT = (
-    "You are a GTM assistant. Score the prospect's potential for the offering from "
-    "1 to 100 based on how good a fit they are, weighing their annual revenue and "
-    "tech stack. In your justification, explicitly list which of the offering's required "
-    "technologies the prospect has and which required technologies they are missing, naming "
-    "each one. Any missing required technology must lower the tech_stack_match component and "
-    "the overall score. Return a score and a justification that reflects your "
-    "overall assessment of this prospect's potential."
+    "You are a GTM assistant. Judge segment fit from 0 to 100 using the offering's "
+    "target segment and the prospect's account details. Explain that judgment and "
+    "the supplied calculated revenue_fit and tech_stack_match components. In your "
+    "justification, name each present and missing required technology from the supplied "
+    "lists. The overall score is calculated in code as the equal-weight average of "
+    "revenue_fit, tech_stack_match, and your segment_fit."
 )
 
 from typing import Literal
@@ -93,33 +93,82 @@ class ProspectScore(BaseModel):
     rubric_breakdown: RubricBreakdown
 
 
-_scoring_llm = ChatOpenAI(model=MODEL_NAME, temperature=0).with_structured_output(ProspectScore)
+class SegmentJudgment(BaseModel):
+    segment_fit: float = Field(ge=0, le=100)
+    justification: str
+
+
+SCORING_WEIGHTS = {"revenue_fit": 1, "tech_stack_match": 1, "segment_fit": 1}
+
+_scoring_llm = ChatOpenAI(model=MODEL_NAME, temperature=0).with_structured_output(SegmentJudgment)
+
+
+def _positive_number(value):
+    "Return a finite positive number, or zero for missing or invalid values."
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return number if math.isfinite(number) and number > 0 else 0.0
+
+
+def _normalized_technologies(values):
+    "Normalize technology names by trimming whitespace and case-folding, ignoring blanks."
+    return {value.strip().casefold() for value in (values or []) if value.strip()}
 
 
 def _offering_has_required_fields(offering):
     "Return True if the offering has the fields needed to score against it."
-    return bool(offering) and bool(offering.get("required_tech_stack")) and \
-        offering.get("min_annual_revenue") is not None and bool(offering.get("description"))
+    return bool(offering) and bool(_normalized_technologies(offering.get("required_tech_stack"))) and \
+        _positive_number(offering.get("min_annual_revenue")) > 0 and bool(offering.get("description"))
 
 
 @tool
 def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict:
-    "Score a prospect profile's potential for an offering on a 1-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
+    "Score a prospect profile's potential for an offering on a 0-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
     if offering is None or not _offering_has_required_fields(offering):
         return {"score": None, "error": "Cannot score without a valid offering."}
     # Score against the prospect's saved tech stack of record.
     pid = prospect_profile.get("prospect_id")
     if pid is not None:
         prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(pid)}
+    required = _normalized_technologies(offering["required_tech_stack"])
+    present = required & _normalized_technologies(prospect_profile.get("tech_stack"))
+    revenue_fit = 100 * min(
+        1.0,
+        _positive_number(prospect_profile.get("annual_revenue")) /
+        _positive_number(offering["min_annual_revenue"]),
+    )
+    tech_stack_match = 100 * len(present) / len(required)
+    calculated = {
+        "revenue_fit": revenue_fit,
+        "tech_stack_match": tech_stack_match,
+        "present_required_technologies": sorted(present),
+        "missing_required_technologies": sorted(required - present),
+    }
     user = (
         "Offering:\n" + json.dumps(offering, indent=2) +
-        "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2)
+        "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2) +
+        "\n\nCalculated components:\n" + json.dumps(calculated, indent=2)
     )
     result = _scoring_llm.invoke([
         {"role": "system", "content": SCORING_PROMPT},
         {"role": "user", "content": user},
     ])
-    return result.model_dump()
+    breakdown = RubricBreakdown(
+        revenue_fit=revenue_fit,
+        tech_stack_match=tech_stack_match,
+        segment_fit=result.segment_fit,
+    )
+    score = sum(
+        getattr(breakdown, component) * weight
+        for component, weight in SCORING_WEIGHTS.items()
+    ) / sum(SCORING_WEIGHTS.values())
+    return ProspectScore(
+        score=round(score, 1),
+        justification=result.justification,
+        rubric_breakdown=breakdown,
+    ).model_dump()
 
 
 @tool

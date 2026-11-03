@@ -102,6 +102,29 @@ cd gtm-agent-engine-workshop
 uv sync
 ```
 
+## Prospect scoring
+
+`score_prospect` returns a 0–100 score: the equal-weight average (weights 1:1:1)
+of revenue fit, technology match, and segment fit, rounded to one decimal place.
+Revenue fit is `100 * min(1, annual_revenue / min_annual_revenue)`; missing,
+non-positive, non-numeric, or non-finite prospect revenue scores zero. Offerings
+with missing or non-positive/non-finite revenue minimums or empty technology
+requirements are rejected as invalid.
+
+Technology match is 100 times the fraction of distinct required technologies
+present, comparing names after trimming whitespace and case-folding and ignoring
+blank names. A missing prospect stack scores zero; when a prospect ID is supplied,
+the stack is fetched from the system of record. The model receives these calculated
+components and the present/missing technology lists to explain them, and supplies
+only segment fit (bounded to 0–100) and justification. Identical component values
+always produce the same overall score; model segment judgments can still vary.
+
+Run the controlled scoring tests without provider credentials:
+
+```bash
+uv run python -m unittest gtm_agent.test_scoring
+```
+
 ## Generate traces
 
 ### Recommended: replay the saved traces (`upload_traces.py`)
