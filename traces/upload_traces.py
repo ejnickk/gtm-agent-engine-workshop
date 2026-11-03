@@ -14,6 +14,7 @@ import random
 import sys
 import time
 from collections import defaultdict
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
@@ -58,6 +59,38 @@ def parse_dt(s):
     if dt.tzinfo is not None:
         dt = dt.replace(tzinfo=None)
     return dt
+
+
+def replay_outputs(outputs, run_type):
+    """Copy non-LLM outputs without duplicated message usage metadata."""
+    if run_type == "llm":
+        return outputs
+    outputs = deepcopy(outputs)
+
+    def strip_message_usage(value):
+        if isinstance(value, dict):
+            if "content" in value and (
+                value.get("type") in ("ai", "human", "system", "tool", "function", "chat", "AIMessageChunk")
+                or value.get("role") in ("assistant", "user", "system", "tool", "function", "developer")
+            ):
+                value.pop("usage_metadata", None)
+            kwargs = value.get("kwargs")
+            message_id = value.get("id")
+            if (
+                value.get("type") == "constructor"
+                and isinstance(message_id, list)
+                and "messages" in message_id
+                and isinstance(kwargs, dict)
+            ):
+                kwargs.pop("usage_metadata", None)
+            for child in value.values():
+                strip_message_usage(child)
+        elif isinstance(value, list):
+            for child in value:
+                strip_message_usage(child)
+
+    strip_message_usage(outputs)
+    return outputs
 
 
 def tool_message(run):
@@ -264,7 +297,7 @@ def main():
                 name=run["name"],
                 run_type=run["run_type"],
                 inputs=run["inputs"],
-                outputs=run.get("outputs"),
+                outputs=replay_outputs(run.get("outputs"), run["run_type"]),
                 error=run.get("error"),
                 extra=run.get("extra"),
                 tags=run.get("tags"),
