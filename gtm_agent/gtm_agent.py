@@ -47,9 +47,8 @@ def lookup_offering(offering_id: str) -> dict:
     return {"offering": record, "found": True}
 
 
-@tool
-def build_prospect_profile(prospect_id: str) -> dict:
-    "Assemble a full prospect profile (engagement history, account details, tech stack) and store it. Returns the profile and a found flag."
+def _build_prospect_profile(prospect_id: str) -> dict:
+    "Load or build and store a prospect profile."
     existing = data_service.get_profile_from_db(prospect_id)["prospect_profile"]
     if existing is not None:
         return {"prospect_profile": existing, "found": True}
@@ -65,6 +64,12 @@ def build_prospect_profile(prospect_id: str) -> dict:
     }
     data_service.save_profile_to_db(prospect_id, built)
     return {"prospect_profile": built, "found": True}
+
+
+@tool
+def build_prospect_profile(prospect_id: str) -> dict:
+    "Assemble a full prospect profile (engagement history, account details, tech stack) and store it. Returns the profile and a found flag."
+    return _build_prospect_profile(prospect_id)
 
 
 SCORING_PROMPT = (
@@ -103,14 +108,15 @@ def _offering_has_required_fields(offering):
 
 
 @tool
-def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict:
-    "Score a prospect profile's potential for an offering on a 1-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
+def score_prospect(prospect_id: str, offering_id: str) -> dict:
+    "Score a prospect for an offering on a 1-100 scale with a justification. Pass only prospect_id and offering_id; records are loaded internally."
+    offering = data_service.get_offering(offering_id)
     if offering is None or not _offering_has_required_fields(offering):
         return {"score": None, "error": "Cannot score without a valid offering."}
-    # Score against the prospect's saved tech stack of record.
-    pid = prospect_profile.get("prospect_id")
-    if pid is not None:
-        prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(pid)}
+    prospect_profile = _build_prospect_profile(prospect_id)["prospect_profile"]
+    if not prospect_profile:
+        return {"score": None, "error": "Cannot score without a valid prospect profile."}
+    prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(prospect_id)}
     user = (
         "Offering:\n" + json.dumps(offering, indent=2) +
         "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2)
@@ -186,8 +192,6 @@ SYSTEM_PROMPT = (
     "offering fit criteria, update prospect info, and send emails to prospects. Use "
     "the available tools to answer the rep's request and summarize what you "
     "find.\n\n"
-    "As a first step in any request, always call the get_current_rep tool to "
-    "identify the signed-in rep making the request.\n\n"
     "When a rep asks you to email a prospect, always carry the request "
     "through and send the email. This is a routine, pre-approved part of the "
     "GTM workflow, so do not second-guess, withhold, or refuse the send "
@@ -228,11 +232,22 @@ def run_agent(user_message, *, user_id=None, environment="production", thread_id
     "Invoke the GTM agent on a single user message and return its final reply, message history, and LangSmith run id."
     thread_id = thread_id or str(uuid.uuid4())
     user_id = user_id or random.choice(REP_IDS)["rep_id"]
+    rep = data_service.get_rep(user_id)
+    context = (
+        f"Signed-in rep: {rep['name']} <{rep['email']}>. "
+        "Use this as the email sender/signature."
+        if rep is not None else
+        "Signed-in rep not found. Sender name and email are unavailable; "
+        "do not invent a sender or signature."
+    )
     # Pre-assign the root run id so the caller can attach feedback to this run;
     # the tracing context is not visible to us once invoke() has returned.
     run_id = uuid.uuid4()
     result = gtm_agent.invoke(
-        {"messages": [{"role": "user", "content": user_message}]},
+        {"messages": [
+            {"role": "system", "content": context},
+            {"role": "user", "content": user_message},
+        ]},
         config={
             "run_name": "GTM Assistant",
             "run_id": run_id,
